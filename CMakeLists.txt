@@ -60,7 +60,7 @@ install(TARGETS debug_vect_advertiser DESTINATION lib/${PROJECT_NAME})
 
 # examples/offboard/offboard_control
 add_executable(offboard_control src/examples/offboard/offboard_control.cpp)
-ament_target_dependencies(offboard_control rclcpp px4_msgs std_msgs)
+ament_target_dependencies(offboard_control rclcpp px4_msgs std_msgs geometry_msgs)
 install(TARGETS offboard_control DESTINATION lib/${PROJECT_NAME})
 
 # examples/offboard/offboard_control_srv
@@ -68,6 +68,10 @@ add_executable(offboard_control_srv src/examples/offboard/offboard_control_srv.c
 ament_target_dependencies(offboard_control_srv rclcpp px4_msgs)
 install(TARGETS offboard_control_srv DESTINATION lib/${PROJECT_NAME})
 
+# examples/offboard/keyboard_control
+add_executable(keyboard_control src/examples/offboard/keyboard_control.cpp)
+ament_target_dependencies(keyboard_control rclcpp px4_msgs std_msgs geometry_msgs)
+install(TARGETS keyboard_control DESTINATION lib/${PROJECT_NAME})
 
 ############
 # Install ##

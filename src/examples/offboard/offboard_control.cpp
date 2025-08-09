@@ -13,7 +13,7 @@
 #include <vector>
 #include <eigen3/Eigen/Dense>
 #include <cstdlib>
-
+#include <geometry_msgs/msg/vector3.hpp>
 
 // Helper: build a float[3] from doubles
 inline std::array<float, 3> make_position(double x, double y, double z) {
@@ -38,14 +38,27 @@ public:
         // --- parameters ---
         declare_parameter<std::string>("uav_namespace", "px4_1");
         declare_parameter<int>("mission_id", 1);
+        declare_parameter<int>("mode", 0);
+
         get_parameter("uav_namespace", uav_namespace_);
         get_parameter("mission_id", mission_id_);
+        get_parameter("mode", mode_);
 
         // derive system ID from namespace suffix ("px4_2" → 2 → +1 → 3)
         inst_ = std::stoi(uav_namespace_.substr(uav_namespace_.find('_') + 1));
         target_system_id_ = static_cast<uint8_t>(inst_ + 1);
         
-        
+        // Handeling Mode Selection
+        if(mode_ == 2){
+            RCLCPP_INFO(this->get_logger(), "Running in MODE 2 : Keyboard Control is available");
+            leader_max_accel_ = 2.5;
+            using_keyboard_input_ = true;
+        }
+        else if(mode_ == 1){
+            RCLCPP_INFO(this->get_logger(), "Running in MODE 1 : Auto Mode is active");
+            auto_mode_ = true;
+        }
+
 
         std::string prefix = "/" + uav_namespace_;
 
@@ -152,6 +165,22 @@ public:
 
 
         //--------------------------------------------------------------------
+        // keyboard Sub
+        keyboard_sub_ = create_subscription<geometry_msgs::msg::Vector3>(
+            "/keyboard_input", 10,
+            [this](geometry_msgs::msg::Vector3::SharedPtr msg) {
+                keyboard_input_ = *msg;
+                current_target_.position[0] += keyboard_input_.x;
+                current_target_.position[1] += keyboard_input_.y;
+                current_target_.position[2] += keyboard_input_.z;
+                RCLCPP_INFO(get_logger(), "New waypoint received from Keyboard Input.");
+                new_waypoint_ = true;
+                last_keyboard_input_time_ = this->now();
+                using_keyboard_input_ = true;
+            }
+        );
+
+
         // Default Formation:
         triangle(5, 'h');
 
@@ -280,7 +309,29 @@ private:
             triangle_active = false;
             square_active = true;
             line_active = false;
-            
+
+            double diameter = sqrt(2) * len;
+            if(leader_id_ == 1){
+                if(direction == 'h') {
+                    RCLCPP_INFO(get_logger(), "Changing Formation to square 'h'");
+                    offsets_ned[2] = {-(diameter/2) + 2 , -(diameter/2) + 2  , 0};
+                    offsets_ned[3] = { 0, -diameter +2 , 0};
+                    offsets_ned[4] = { (diameter/2) - 2 , -(diameter/2) + 2  , 0};
+                }
+                else if(direction == 'v'){
+                    RCLCPP_INFO(get_logger(), "Changing Formation to square 'v'");
+                    offsets_ned[2] = {-(diameter/2) + 2 , 2  , -(diameter/2)};
+                    offsets_ned[3] = { 0, 2 , -diameter};
+                    offsets_ned[4] = { (diameter/2) - 2 , 2  , -(diameter/2)};
+                }
+            }
+            else if(leader_id_ == 2){
+                RCLCPP_INFO(get_logger(), "Square formation is not available for 3 drones.");
+            } 
+
+            off_x_ = offsets_ned[inst_][0];
+            off_y_ = offsets_ned[inst_][1];
+            off_z_ = offsets_ned[inst_][2];
         }
 
     // line:
@@ -303,6 +354,7 @@ private:
                         offsets_ned[4] = { -2 , 2, -2*len/3  };
                     }
                 }
+            
             else if(leader_id_ == 2){
                 if(direction =='h'){
                         offsets_ned[3] = { -2, -len/2 , 0};
@@ -316,7 +368,6 @@ private:
             off_x_ = offsets_ned[inst_][0];
             off_y_ = offsets_ned[inst_][1];
             off_z_ = offsets_ned[inst_][2];
-
         }
 
     // leader situation
@@ -342,36 +393,43 @@ private:
 
 
     // --- ROS interfaces ---
-    rclcpp::TimerBase::SharedPtr                timer_;
+    rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::Publisher<OffboardControlMode>::SharedPtr  offb_mode_pub_;
     rclcpp::Publisher<TrajectorySetpoint>::SharedPtr   traj_sp_pub_;
     rclcpp::Publisher<VehicleCommand>::SharedPtr       cmd_pub_;
     rclcpp::Publisher<std_msgs::msg::UInt32>::SharedPtr path_index_pub_; // Auto Mode
     rclcpp::Publisher<px4_msgs::msg::VehicleOdometry>::SharedPtr leader_odom_pub_;
     
+    rclcpp::Subscription<geometry_msgs::msg::Vector3>::SharedPtr keyboard_sub_; // keyboard
     rclcpp::Subscription<VehicleOdometry>::SharedPtr   self_odom_sub_;
     rclcpp::Subscription<VehicleOdometry>::SharedPtr   leader_odom_sub_;
     rclcpp::Subscription<TrajectorySetpoint>::SharedPtr waypoint_sub_;
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr command_sub_;
     rclcpp::Subscription<std_msgs::msg::UInt32>::SharedPtr path_index_sub_; // Auto mode
-
+    
     // --- state & params ---
     std::string uav_namespace_;
     int inst_ = 0;
     int mission_id_;
     uint8_t target_system_id_{1};
     int leader_id_ =1;
-    bool auto_mode_ = true;
-    std::vector<std::array<float, 3>> path_; 
-    size_t current_wp_idx_ = 0;
-    uint32_t last_known_wp_idx_ = 0;
+    int mode_ = 0;                           // Mode param
+    bool auto_mode_ = false;                 // Auto Mode
+    std::vector<std::array<float, 3>> path_; // Auto mode 
+    size_t current_wp_idx_ = 0;              // Auto mode
+    uint32_t last_known_wp_idx_ = 0;         // Auto mode
     VehicleOdometry leader_odom_;
     VehicleOdometry self_odom_;
+    
+    // Keyboard Params
+    geometry_msgs::msg::Vector3 keyboard_input_;
+    rclcpp::Time last_keyboard_input_time_;
+    bool using_keyboard_input_ = false;
 
     //--------------------------------------- speed sync
     const int    leader_wait_threshold_ = 20;     // ticks at 100 ms → 2 s hold
     const double leader_max_speed_      = 5.0;    // m/s
-    const double leader_max_accel_      = 1.8;    // m/s²
+    double leader_max_accel_      = 1.5;    // m/s²
     const double leader_dt_             = 0.12;   // seconds per control loop (50 Hz)
 
     // For leader waypoint motion
@@ -434,8 +492,6 @@ private:
 
         
         if ((mission_id_ == leader_id_ || !received_leader_pose_)) {
-            
-            
             // leader logic
             if(offboard_sp_counter_ <= 70){
                 sp.position = make_position(lx, ly, -5.0);
@@ -487,7 +543,13 @@ private:
                 }
 
                 else {
-                    sp.position = make_position(lx, ly, -5.0);
+                    if(offboard_sp_counter_< 70){
+                        sp.position = make_position(lx, ly, -5.0);
+                    }
+                    else{
+                        sp.position = make_position(lx, ly, lz);
+                    }
+                    
                     if (auto_mode_ && current_wp_idx_ < path_.size()) {
                         current_target_.position[0] = path_[current_wp_idx_][0];
                         current_target_.position[1] = path_[current_wp_idx_][1];
@@ -510,9 +572,53 @@ private:
         sp.yaw = 0.0f;
         traj_sp_pub_->publish(sp);
     }
+    
+    // publish trajectory on keyboard mode
+//     void publish_trajectory_kb(){
+//         TrajectorySetpoint sp{};
+//         sp.timestamp = now().nanoseconds() / 1000;
+//         Eigen::Vector3d current_pos(self_odom_.position[0], self_odom_.position[1], self_odom_.position[2]);
 
+//         double lx = 0.0, ly = 0.0, lz = 0.0;
+
+//         if(received_leader_pose_){
+//             lx = leader_odom_.position[0];
+//             ly = leader_odom_.position[1];
+//             lz = leader_odom_.position[2];
+//         }
+
+//         if(new_waypoint_){
+//             if(leader_id_ == mission_id_){
+//                 Eigen::Vector3d goal(current_target_.position[0],
+//                                     current_target_.position[1],
+//                                     current_target_.position[2]);
+//                 Eigen::Vector3d delta = goal - current_pos;
+//                 double dist = delta.norm();    
+//                 if (dist < 0.3) {
+//                     new_waypoint_ = false;
+//                     RCLCPP_INFO(get_logger(), "Holding Position...");
+//                     sp.position = make_position(goal.x(), goal.y(), goal.z());
+//                 }
+//                 else{
+//                     sp.position = make_position(goal.x(), goal.y(), goal.z());
+//                 } 
+//             }    
+//         }
+        
+//         else{
+//             if(offboard_sp_counter_<= 70){
+//                 sp.position = make_position(0, 0, -5);
+//             }
+//             else{
+//                 sp.position = make_position(current_pos[0],current_pos[1], current_pos[2]);
+//             }
+            
+//         }
+
+//         sp.yaw = 0.0f;
+//         traj_sp_pub_->publish(sp);
+//     }
 };
-
 
 int main(int argc, char *argv[])
 {
