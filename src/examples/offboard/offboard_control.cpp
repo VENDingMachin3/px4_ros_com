@@ -66,8 +66,10 @@ public:
         offb_mode_pub_ = create_publisher<OffboardControlMode>(prefix + "/fmu/in/offboard_control_mode", 10);
         traj_sp_pub_   = create_publisher<TrajectorySetpoint>(prefix + "/fmu/in/trajectory_setpoint", 10);
         cmd_pub_       = create_publisher<VehicleCommand>(prefix + "/fmu/in/vehicle_command", 10);
-        leader_odom_pub_ = this->create_publisher<px4_msgs::msg::VehicleOdometry>("/leader_odometry", rclcpp::QoS(10).best_effort());
-
+        if(inst_ == 1) leader_odom_pub_ = this->create_publisher<px4_msgs::msg::VehicleOdometry>("/leader_odometry1", rclcpp::QoS(10).best_effort());
+        else if(inst_ == 2) leader_odom_pub_ = this->create_publisher<px4_msgs::msg::VehicleOdometry>("/leader_odometry2", rclcpp::QoS(10).best_effort());
+        
+        
         // --- subs ---
         // PX4 publishes VehicleOdometry with Best Effort reliability
         rclcpp::QoS odom_qos = rclcpp::QoS(rclcpp::KeepLast(10))
@@ -85,13 +87,39 @@ public:
         );
         // Leader Odom Sub
         leader_odom_sub_ = this->create_subscription<px4_msgs::msg::VehicleOdometry>(
-            "/leader_odometry", odom_qos,
-            [this](VehicleOdometry::SharedPtr msg) {
-                leader_odom_ = *msg;
-                last_leader_odom_time_ = this->now();
-                received_leader_pose_ = true;
-            });
+    "/leader_odometry1", odom_qos,
+    [this](px4_msgs::msg::VehicleOdometry::SharedPtr msg) {
 
+        // previous PX4 timestamp stored in the last received message
+        uint64_t prev_px4_ts = leader_odom_.timestamp; // 0 if none yet
+        uint64_t new_px4_ts  = msg->timestamp;       // PX4 timestamps are microseconds
+
+        // Minimum advance to consider this a new update (in microseconds).
+        // Use 0 if you want any change to count, otherwise a small threshold
+        // helps ignore duplicate/identical repeated messages.
+        const uint64_t MIN_DELTA_US = 1000; // 1 ms
+
+        if (prev_px4_ts == 0) {
+            // First message ever received for this subscription.
+            // Option: you can add extra checks here (age vs now) if desired.
+            leader_odom_ = *msg;
+            last_leader_odom_time_ = this->now();
+            received_leader_pose_ = true;
+            RCLCPP_INFO(get_logger(), "First leader odom accepted (px4 ts: %lu).", new_px4_ts);
+        } else if (new_px4_ts > prev_px4_ts + MIN_DELTA_US) {
+            // PX4 timestamp advanced — this is a fresh update; accept it.
+            leader_odom_ = *msg;
+            last_leader_odom_time_ = this->now();
+            received_leader_pose_ = true;
+            // Optional debug:
+            // RCLCPP_DEBUG(get_logger(), "Fresh leader odom (delta_us=%lu).", new_px4_ts - prev_px4_ts);
+        } else {
+            // Timestamp has not advanced (duplicate/stale). Ignore for timeout purposes.
+            RCLCPP_DEBUG(get_logger(), "Ignoring stale/duplicate leader odom (px4 ts: %lu).", new_px4_ts);
+        }
+    });
+       
+        
         // Getting Waypoits using Topic
         
         std::string waypoint_topic = "/leader/waypoint";
@@ -133,7 +161,7 @@ public:
                     RCLCPP_INFO(get_logger(), "Parsed command='%s', length=%.1f, dir='%c', formation='%s'",
                                 cmd.c_str(), formation_length_, formation_direction_, formation_type_.c_str());
                         if (cmd == "disarm") {
-                            if (inst_ == 1) {
+                            if (inst_ == leader_id_) {
                                 leader_odom_pub_.reset(); // kill the leader's odom publisher 
                                 rclcpp::sleep_for(std::chrono::seconds(3));
                                 timer_->cancel();
@@ -153,16 +181,17 @@ public:
         
         // ------------------------- Auto Mode ------------------------------
         // setting path_ for leader in auto mode:
-        if(inst_ == leader_id_) set_path_();
-        
-        path_index_pub_ = this->create_publisher<std_msgs::msg::UInt32>("leader/path_index", 10);
+        if(auto_mode_){
+            if(inst_ == leader_id_) set_path_();
+            
+            path_index_pub_ = this->create_publisher<std_msgs::msg::UInt32>("leader/path_index", 10);
 
-        path_index_sub_ = this->create_subscription<std_msgs::msg::UInt32>(
-        "leader/path_index", 10,
-        [this](const std_msgs::msg::UInt32::SharedPtr msg) {
-            last_known_wp_idx_ = msg->data;
-        });
-
+            path_index_sub_ = this->create_subscription<std_msgs::msg::UInt32>(
+            "leader/path_index", 10,
+            [this](const std_msgs::msg::UInt32::SharedPtr msg) {
+                last_known_wp_idx_ = msg->data;
+            });
+        }
 
         //--------------------------------------------------------------------
         // keyboard Sub
@@ -193,8 +222,9 @@ public:
                 // switch leader
                 if (dt > leader_timeout_sec_ && !using_backup_leader_) {
                     RCLCPP_WARN(get_logger(), "Leader timeout. Switching to px4_2 as leader.");
+                    if(inst_ == leader_id_+1) rclcpp::sleep_for(std::chrono::milliseconds(100)); // this is just to make sure all drones execute this part
                     using_backup_leader_ = true;
-                    switch_to_new_leader("/leader_odometry");
+                    switch_to_new_leader("/leader_odometry2");
                     // update offsets here too
                     
                 }
@@ -248,8 +278,8 @@ private:
     // ------------------ formations ----------------------
     // ---- formation params ----
     std::string formation_type_ = "triangle";
-    double formation_length_ = 7.0;
-    char formation_direction_ = 'v';
+    double formation_length_ = 5.0;
+    char formation_direction_ = 'h';
     bool triangle_active{false};
     bool square_active{false};
     bool line_active{false};
@@ -378,7 +408,9 @@ private:
     // change leader
     void switch_to_new_leader(const std::string& new_topic) {
         RCLCPP_INFO(get_logger(), "Running switch Function.... ");
-        leader_id_ = 2;  // update leader ID
+        leader_id_ ++;  // update leader ID
+        leader_odom_sub_.reset();
+        
         RCLCPP_INFO(get_logger(), "New Leader ID: %d", leader_id_);
         if(inst_ == leader_id_){
             set_path_(); // let the new leader to know the path 
@@ -386,6 +418,16 @@ private:
             RCLCPP_INFO(get_logger(), "Current idx: %ld", current_wp_idx_);
             RCLCPP_INFO(get_logger(), "Last Known idx: %d", last_known_wp_idx_);    
         }
+
+        leader_odom_sub_ = this->create_subscription<px4_msgs::msg::VehicleOdometry>(
+        new_topic ,
+        rclcpp::QoS(rclcpp::KeepLast(10)).best_effort().durability_volatile(),
+        [this](px4_msgs::msg::VehicleOdometry::SharedPtr msg) {
+            leader_odom_ = *msg;
+            last_leader_odom_time_ = this->now();
+            received_leader_pose_ = true;
+        });
+
         if (triangle_active) triangle(formation_length_, formation_direction_);
         else if (square_active) square(formation_length_, formation_direction_);
         else if (line_active) line(formation_length_, formation_direction_);   
@@ -427,10 +469,10 @@ private:
     bool using_keyboard_input_ = false;
 
     //--------------------------------------- speed sync
-    const int    leader_wait_threshold_ = 20;     // ticks at 100 ms → 2 s hold
-    const double leader_max_speed_      = 5.0;    // m/s
-    double leader_max_accel_      = 1.5;    // m/s²
-    const double leader_dt_             = 0.12;   // seconds per control loop (50 Hz)
+    const int    leader_wait_threshold_ = 20;      // ticks at 100 ms → 2 s hold
+    const double leader_max_speed_      = 12.0;    // m/s
+    double leader_max_accel_            = 1.5;     // m/s²
+    const double leader_dt_             = 0.125;   // seconds per control loop (100/80 Hz)
 
     // For leader waypoint motion
     double leader_current_speed_ = 0.0;
@@ -443,8 +485,11 @@ private:
     path_= {
         {0.0f, 0.0f, -5.0f},
         {10.0f, 10.0f, -5.0f},
-        {15.0f, -10.0f, -5.0f},
+        {20.0f, 50.0f, -10.0f},
+        {15.0f, -10.0f, -10.0f},
+        {-15.0f, 20.0f, -10.0f},        
         {0.0f, 0.0f, -5.0f},
+        {0.0f, 0.0f, 0.0f}
         };
     }   
 
@@ -493,7 +538,7 @@ private:
         
         if ((mission_id_ == leader_id_ || !received_leader_pose_)) {
             // leader logic
-            if(offboard_sp_counter_ <= 70){
+            if(offboard_sp_counter_ <= 100){
                 sp.position = make_position(lx, ly, -5.0);
             }
             else {
@@ -543,13 +588,7 @@ private:
                 }
 
                 else {
-                    if(offboard_sp_counter_< 70){
-                        sp.position = make_position(lx, ly, -5.0);
-                    }
-                    else{
-                        sp.position = make_position(lx, ly, lz);
-                    }
-                    
+                    sp.position = make_position(lx, ly, lz);                    
                     if (auto_mode_ && current_wp_idx_ < path_.size()) {
                         current_target_.position[0] = path_[current_wp_idx_][0];
                         current_target_.position[1] = path_[current_wp_idx_][1];

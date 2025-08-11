@@ -7,7 +7,7 @@ def generate_launch_description():
     # Declare the "mode" argument with a default value of 0
     mode_arg = DeclareLaunchArgument(
         'mode',
-        default_value='0',
+        default_value='0',  # for default mode
         description='Mode selection: 0, 1, or 2  -> Default, Auto, or Keyboard Control '
     )
 
